@@ -1,0 +1,20 @@
+Metadata-Version: 2.1
+Name: autodp
+Version: 0.2.3.1
+Summary: Automating Differential Privacy Computation
+Home-page: https://github.com/yuxiangw/autodp
+Download-URL: https://github.com/yuxiangw/autodp/archive/refs/tags/v0.2.3.tar.gz
+Author: Yu-Xiang Wang
+Author-email: yuxiangw@cs.ucsb.edu
+License: Apache
+Keywords: Differential Privacy,Moments Accountant,Renyi Differential Privacy
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Security
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+License-File: LICENSE
+
+The package helps researchers and developers to correctly use advanced methods in differential privacy and obtain provable DP guarantees. The core of the package is an analytical moments accountant that keeps track of Renyi Differential Privacy in analytical forms.
