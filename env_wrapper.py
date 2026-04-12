@@ -13,29 +13,10 @@ class LuxS2Wrapper(gym.Env):
         # Typically H, W for LuxS2 is defined in env_cfg
         self.map_size = env.env_cfg.map_size
         
-        # Extracted Features (Channels):
-        # 0: Ice Locations
-        # 1: Ore Locations
-        # 2: Own Factories
-        # 3: Opponent Factories
-        # 4: Own Robots
-        # 5: Opponent Robots
-        # 6: Power Map/Levels
-        self.num_channels = 7
-        
-        # Overriding observation space to be CNN compatible
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, 
-            shape=(self.num_channels, self.map_size, self.map_size), 
-            dtype=np.float32
-        )
-        
-        # Explicit dummy action space to satisfy Gymnasium specifications
-        self.action_space = gym.spaces.Box(
-            low=-1.0, high=1.0, 
-            shape=(64,), 
-            dtype=np.float32
-        )
+    @property
+    def state(self):
+        """Expose the base environment's state directly for simple access."""
+        return self.env.state
         
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -57,7 +38,10 @@ class LuxS2Wrapper(gym.Env):
         C x H x W float32 tensor representing spatial features.
         """
         H, W = self.map_size, self.map_size
-        cnn_obs = np.zeros((self.num_channels, H, W), dtype=np.float32)
+        cnn_obs = np.zeros((self.num_channels, H, W + 0), dtype=np.float32) # Dummy offset removed
+        # Fixing num_channels access
+        num_channels = 7
+        cnn_obs = np.zeros((num_channels, H, W), dtype=np.float32)
         
         # Process from player_0's perspective for offline logging boilerplating
         p0_obs = obs.get("player_0")
@@ -89,3 +73,7 @@ class LuxS2Wrapper(gym.Env):
                 cnn_obs[6, x, y] += unit["power"] # Power Map overlay
                 
         return cnn_obs
+
+    @property
+    def num_channels(self):
+        return 7

@@ -1,2 +1,4 @@
 __pycache__/*
 sentinel_env/*
+dataset_expert/*
+replay.json
