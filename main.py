@@ -144,6 +144,17 @@ def get_heuristic_actions(obs, player, env):
                 if 0 <= nx < ice.shape[0] and 0 <= ny < ice.shape[1]:
                     ice[nx, ny] = 0
                     ore[nx, ny] = 0
+                    
+    # USER REQUEST 3: Rakip fabrikanın 5x5 tamponunu filtrele
+    enemy_factories = p_obs.get("factories", {}).get(enemy, {})
+    for f_id, f_data in enemy_factories.items():
+        fx, fy = f_data["pos"]
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                nx, ny = fx + dx, fy + dy
+                if 0 <= nx < ice.shape[0] and 0 <= ny < ice.shape[1]:
+                    ice[nx, ny] = 0
+                    ore[nx, ny] = 0
     
     ice_coords = np.argwhere(ice > 0)
     ore_coords = np.argwhere(ore > 0)
@@ -152,10 +163,20 @@ def get_heuristic_actions(obs, player, env):
     if len(ore_coords) == 0: ore_coords = general_resource_coords
 
     # --- KOORDİNASYON FAZI: Rescue (Pull) Kontrolü ---
+    FACTORY_PANIC_MAP = {}
     thirsty_factories = []
     for f_id, f_data in factories.items():
-        if f_data.get("cargo", {}).get("water", 0) < 30:
-            thirsty_factories.append({"id": f_id, "pos": f_data["pos"], "water": f_data.get("cargo", {}).get("water", 0)})
+        f_pos = f_data["pos"]
+        closest_ice_dist = 0
+        if len(ice_coords) > 0:
+            dist_to_ice = np.abs(ice_coords - f_pos).sum(axis=1)
+            closest_ice_dist = np.min(dist_to_ice)
+            
+        panic_threshold = 150 if closest_ice_dist > 15 else 100
+        FACTORY_PANIC_MAP[f_id] = panic_threshold
+        
+        if f_data.get("cargo", {}).get("water", 0) < panic_threshold:
+            thirsty_factories.append({"id": f_id, "pos": f_pos, "water": f_data.get("cargo", {}).get("water", 0)})
             
     # Rescue görevlendirmeleri (Geçici)
     rescue_assignments = {} # unit_id -> target_factory_pos
@@ -168,8 +189,9 @@ def get_heuristic_actions(obs, player, env):
             if udata.get("cargo", {}).get("ice", 0) > 0:
                 # Kendi evi de susuzsa başkasına yardım edemez (Override kuralı hazırlığı)
                 home_fid = UNIT_HOME_MAP.get(uid)
+                panic_thresh = FACTORY_PANIC_MAP.get(home_fid, 100)
                 home_water = factories.get(home_fid, {}).get("cargo", {}).get("water", 999) if home_fid else 999
-                if home_water >= 30:
+                if home_water >= panic_thresh:
                     helpers_with_ice.append({"id": uid, "pos": udata["pos"], "ice": udata["cargo"]["ice"]})
         
         for thirsty in thirsty_factories:
@@ -202,7 +224,7 @@ def get_heuristic_actions(obs, player, env):
     enemy_units = p_obs.get("units", {}).get(enemy, {})
     team_reserved_tiles = set()
 
-    def get_safe_direction(u_pos, t_pos, strict_obs, relaxed_obs):
+    def get_safe_direction(u_pos, t_pos, strict_obs, relaxed_obs, w=ice.shape[0], h=ice.shape[1]):
         diff = t_pos - u_pos
         dirs = []
         if abs(diff[0]) > abs(diff[1]):
@@ -215,13 +237,13 @@ def get_heuristic_actions(obs, player, env):
         # 1. Strict
         for d in dirs:
             nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
-            if (nx, ny) not in strict_obs:
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in strict_obs:
                 return d
                 
         # 2. Relaxed
         for d in dirs:
             nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
-            if (nx, ny) not in relaxed_obs:
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in relaxed_obs:
                 return d
                 
         return 0 # Return 0 (center/wait) if trapped
@@ -363,7 +385,13 @@ def get_heuristic_actions(obs, player, env):
                 is_commited = True
 
             # 1. OVERRIDE: Kendi evim yanıyorsa her şeyi bırak geri dön!
-            elif home_water < 30 and total_cargo > 0:
+            panic_thresh = FACTORY_PANIC_MAP.get(home_fid, 100)
+            if home_water < panic_thresh and total_cargo > 0:
+                target_pos = home_pos
+                is_commited = True
+        
+            # 1.5 HYSTERESIS (Çıkış Bariyeri): Evdeysen 1000 güce ulaşmadan göreve çıkma!
+            elif is_on_home_anyway and unit_power < 1000 and total_cargo == 0:
                 target_pos = home_pos
                 is_commited = True
         
@@ -384,16 +412,8 @@ def get_heuristic_actions(obs, player, env):
                 if is_on_target:
                     # Sadece kendi evimizdeysek şarj olabiliriz
                     is_on_home = (home_pos is not None) and max(abs(pos[0] - home_pos[0]), abs(pos[1] - home_pos[1])) <= 1
-                
+                    
                     action_assigned = False
-
-                    if is_on_home:
-                        home_fac_power = home_data.get("power", 0)
-                        if unit_power < 3000 and home_fac_power > 0: # 1500 baraji kalkti, 3000'e kadar sarj izni
-                            pickup_amount = min(home_fac_power, 3000 - unit_power)
-                            if pickup_amount > 0:
-                                actions[unit_id] = [np.array([2, 0, 4, pickup_amount, 0, 1])]
-                                action_assigned = True
 
                     # Kargo Aktarımı (Target ne olursa olsun yapilabilir, ornegin rescue edilen fabrikaya water atmak icin)
                     if not action_assigned and total_cargo > 0:
@@ -403,6 +423,14 @@ def get_heuristic_actions(obs, player, env):
                         elif cargo.get("ore", 0) > 0:
                             actions[unit_id] = [np.array([1, 0, 1, cargo["ore"], 0, 1])] # Ore transfer
                             action_assigned = True
+
+                    if is_on_home and not action_assigned and total_cargo == 0:
+                        home_fac_power = home_data.get("power", 0)
+                        if unit_power < 3000 and home_fac_power > 0: # 1500 baraji kalkti, 3000'e kadar sarj izni
+                            pickup_amount = min(home_fac_power, 3000 - unit_power)
+                            if pickup_amount > 0:
+                                actions[unit_id] = [np.array([2, 0, 4, pickup_amount, 0, 1])]
+                                action_assigned = True
 
                     # EJECTION PROTOCOL: Kargomuz yok, şarjımız 1500+ ve EVDEYSEK (hemen cikip Idle Task'a düs!)
                     if not action_assigned and is_on_home and unit_power > 1500 and total_cargo == 0 and len(ice_coords) > 0:
@@ -468,10 +496,14 @@ def get_heuristic_actions(obs, player, env):
                     # Rastgele Keşif ve Rubble Temizleme
                     cx, cy = pos[0], pos[1]
                     curr_rubble = rubble[cx, cy] if cx < rubble.shape[0] and cy < rubble.shape[1] else 0
-                
+                    
+                    # Rubble Clearing on Exit: Eğer evimize tam 2 birim uzaktaysak ve moloz varsa KESİN temizle
+                    dist_to_home = max(abs(pos[0] - home_pos[0]), abs(pos[1] - home_pos[1])) if home_pos is not None else 99
+                    if dist_to_home == 2 and curr_rubble > 0:
+                        actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Zorunlu Yol Temizliği)
                     # Eğer rubble varsa %15 ihtimalle, rubble yoksa %5 ihtimalle yolda "Dig" yaparak keşfe zaman ayır
-                    if (curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05:
-                        actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Rubble temizliği / Mola)
+                    elif (curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05:
+                        actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Rastgele Temizlik)
                     else:
                         direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
                         actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]  # MOVE
@@ -535,7 +567,7 @@ def get_heuristic_actions(obs, player, env):
                 actions[occupying_unit] = [np.array([0, force_direction, 0, 0, 0, 1])]
             
             actions[f_id] = 1   # Heavy Robot üret
-        elif cargo.get("water", 0) >= 100 and f_data.get("power", 0) >= 50:
+        elif cargo.get("water", 0) >= 150 and f_data.get("power", 0) >= 50:
             actions[f_id] = 2   # Lichen sula (yalnızca su fazlaysa)
 
     return actions
