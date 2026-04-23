@@ -187,7 +187,10 @@ def get_heuristic_actions(obs, player, env):
             for dy in range(-2, 3):
                 enemy_factory_tiles.add((fx + dx, fy + dy))
 
-    def get_safe_direction(u_pos, t_pos, obstacles):
+    enemy_units = p_obs.get("units", {}).get(enemy, {})
+    team_reserved_tiles = set()
+
+    def get_safe_direction(u_pos, t_pos, strict_obs, relaxed_obs):
         diff = t_pos - u_pos
         dirs = []
         if abs(diff[0]) > abs(diff[1]):
@@ -196,36 +199,99 @@ def get_heuristic_actions(obs, player, env):
             dirs.extend([(3 if diff[1] > 0 else 1), (2 if diff[0] > 0 else 4), (4 if diff[0] > 0 else 2), (1 if diff[1] > 0 else 3)])
             
         move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0)}
+        
+        # 1. Strict
         for d in dirs:
             nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
-            if (nx, ny) not in obstacles:
+            if (nx, ny) not in strict_obs:
                 return d
+                
+        # 2. Relaxed
+        for d in dirs:
+            nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
+            if (nx, ny) not in relaxed_obs:
+                return d
+                
         return 0 # Return 0 (center/wait) if trapped
 
-    for unit_id, unit_data in units.items():
-        pos = np.array(unit_data["pos"])
-        cargo = unit_data.get("cargo", {})
+    # --- PRIORITY SORTING ---
+    unit_sort_data = []
+    for uid, udata in units.items():
+        power = udata.get("power", 0)
+        cargo = udata.get("cargo", {})
         total_cargo = cargo.get("ice", 0) + cargo.get("ore", 0)
-        unit_power = unit_data.get("power", 0)
-        has_empty_queue = (len(unit_data.get("action_queue", [])) == 0)
-
-        # --- HOME FACTORY ATAMASI ---
-        if unit_id not in UNIT_HOME_MAP and len(factories) > 0:
+        pos = np.array(udata["pos"])
+        
+        home_fid = UNIT_HOME_MAP.get(uid)
+        if home_fid is None and len(factories) > 0:
             f_ids = list(factories.keys())
             f_positions = [factories[fid]["pos"] for fid in f_ids]
             closest_f_idx = np.argmin(np.abs(np.array(f_positions) - pos).sum(axis=1))
-            UNIT_HOME_MAP[unit_id] = f_ids[closest_f_idx]
-        
-        home_fid = UNIT_HOME_MAP.get(unit_id)
-        home_data = factories.get(home_fid, {})
-        home_pos = home_data.get("pos")
-        home_water = home_data.get("cargo", {}).get("water", 999)
-
-        # EMERGENCY OVERRIDE CHECK
-        is_emergency = False
-        if unit_power < 150 and home_pos is not None:
-            is_emergency = True
+            home_fid = f_ids[closest_f_idx]
+            UNIT_HOME_MAP[uid] = home_fid
             
+        home_pos = factories.get(home_fid, {}).get("pos") if home_fid else None
+        is_emergency = (power < 150 and home_pos is not None)
+        uid_num = int(uid.split('_')[1]) if '_' in uid else 0
+        
+        unit_sort_data.append({
+            "uid": uid,
+            "data": udata,
+            "is_emergency": is_emergency,
+            "power": power,
+            "cargo": total_cargo,
+            "uid_num": uid_num,
+            "home_pos": home_pos,
+            "home_fid": home_fid
+        })
+        
+    unit_sort_data.sort(key=lambda x: (not x["is_emergency"], x["power"], -x["cargo"], x["uid_num"]))
+
+    for item in unit_sort_data:
+        unit_id = item["uid"]
+        unit_data = item["data"]
+        pos = np.array(unit_data["pos"])
+        cargo = unit_data.get("cargo", {})
+        total_cargo = item["cargo"]
+        unit_power = item["power"]
+        has_empty_queue = (len(unit_data.get("action_queue", [])) == 0)
+        
+        home_fid = item["home_fid"]
+        home_data = factories.get(home_fid, {})
+        home_pos = item["home_pos"]
+        home_water = home_data.get("cargo", {}).get("water", 999)
+        is_emergency = item["is_emergency"]
+        
+        # --- THREAT ASSESSMENT (ROE) ---
+        my_type = unit_data.get("unit_type", 0)
+        strict_threat_tiles = set()
+        relaxed_threat_tiles = set()
+        for e_id, e_data in enemy_units.items():
+            e_pos = e_data["pos"]
+            e_type = e_data.get("unit_type", 0)
+            e_power = e_data.get("power", 0)
+            
+            is_threat = False
+            if is_emergency:
+                is_threat = True
+            elif e_type == 1 and my_type == 0:
+                is_threat = True
+            elif e_type == my_type and e_power > unit_power + 200:
+                is_threat = True
+                
+            if is_threat:
+                for dx in range(-2, 3):
+                    for dy in range(-2, 3):
+                        strict_threat_tiles.add((e_pos[0]+dx, e_pos[1]+dy))
+                for dx in range(-1, 2):
+                    for dy in range(-1, 2):
+                        relaxed_threat_tiles.add((e_pos[0]+dx, e_pos[1]+dy))
+                        
+        strict_obstacles = enemy_factory_tiles | strict_threat_tiles | team_reserved_tiles
+        relaxed_obstacles = enemy_factory_tiles | relaxed_threat_tiles | team_reserved_tiles
+
+        # --- HOME FACTORY ATAMASI ---
+        # (Ön hesaplama bölümünde yapıldığı için sadece prev_pos kaldi)
         # Stuck time tracking (Enerjiyi bosuna tuketmemek icin)
         prev_pos = UNIT_PREV_POS.get(unit_id, pos)
         if np.array_equal(pos, prev_pos):
@@ -243,13 +309,13 @@ def get_heuristic_actions(obs, player, env):
             actions[unit_id] = [] # Vandalizmi durdur, kuyruğu temizle (Clear Queue)
             has_empty_queue = True
             
-        # INVALID ACTION QUEUE CLEARANCE (Rakip fabrikayı süpürme)
+        # INVALID ACTION QUEUE CLEARANCE (Rakip fabrikayı ve tehditleri süpürme)
         if not has_empty_queue and q_action == 0:
             q_dir = unit_data.get("action_queue")[0][1]
             move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0), 0: (0, 0)}
             nx = pos[0] + move_deltas.get(q_dir, (0,0))[0]
             ny = pos[1] + move_deltas.get(q_dir, (0,0))[1]
-            if (nx, ny) in enemy_factory_tiles:
+            if (nx, ny) in strict_obstacles:
                 actions[unit_id] = []
                 has_empty_queue = True
             
@@ -328,7 +394,7 @@ def get_heuristic_actions(obs, player, env):
                     dist_to_ice = np.abs(ice_coords - pos).sum(axis=1)
                     closest_ice = ice_coords[np.argmin(dist_to_ice)]
                     diff_ice = closest_ice - pos
-                    direction = get_safe_direction(pos, closest_ice, enemy_factory_tiles)
+                    direction = get_safe_direction(pos, closest_ice, strict_obstacles, relaxed_obstacles)
                     actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
                     action_assigned = True
                     
@@ -338,9 +404,9 @@ def get_heuristic_actions(obs, player, env):
                     is_commited = False # Action: None 'durumuna pusu kurmak yerine is bulmaya gec!
 
             else:
-                direction = get_safe_direction(pos, target_pos, enemy_factory_tiles)
+                direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
                 actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
-                continue  
+                # NOT continue here! We must hit the Tile Reservation block at the end of the loop!
 
         # --- YENİ KAYNAK HEDEFİ BELİRLEME, BEKLEME İSTASYONU VEYA MOLOZ TEMİZLİĞİ ---
         # 1. Bekleme İstasyonu: Eğar unit dolu degilse, işi bittiyse ve sarji yerindeyse.
@@ -354,7 +420,7 @@ def get_heuristic_actions(obs, player, env):
                     if max(abs(dx), abs(dy)) == 2:
                         rx, ry = home_pos[0] + dx, home_pos[1] + dy
                         if 0 <= rx < rubble.shape[0] and 0 <= ry < rubble.shape[1]:
-                            if (rx, ry) not in GLOBAL_RESERVED_TILES:
+                            if (rx, ry) not in team_reserved_tiles:
                                 # Daha cok rubble olan yere park et ki orayi temizlesin
                                 r_val = rubble[rx, ry]
                                 if r_val > best_rubble:
@@ -362,7 +428,7 @@ def get_heuristic_actions(obs, player, env):
                                     best_park_pos = np.array([rx, ry])
                                     
             if best_park_pos is not None:
-                GLOBAL_RESERVED_TILES.add((best_park_pos[0], best_park_pos[1]))
+                team_reserved_tiles.add((best_park_pos[0], best_park_pos[1]))
                 # Sadece moloz varsa parkta kal, yoksa diger kaynaklara dogru Ejection baslasin.
                 if best_rubble > 0 or np.array_equal(pos, home_pos):
                     target_pos = best_park_pos
@@ -392,8 +458,32 @@ def get_heuristic_actions(obs, player, env):
                 if (curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05:
                     actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Rubble temizliği / Mola)
                 else:
-                    direction = get_safe_direction(pos, target_pos, enemy_factory_tiles)
+                    direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
                     actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]  # MOVE
+
+        # --- ROTA REZERVASYONU (Tile Reservation) ---
+        assigned_action = actions.get(unit_id)
+        if assigned_action and len(assigned_action) > 0:
+            act = assigned_action[0]
+            if act[0] == 0: # Move
+                direction = act[1]
+                move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0), 0: (0, 0)}
+                nx, ny = pos[0] + move_deltas.get(direction, (0,0))[0], pos[1] + move_deltas.get(direction, (0,0))[1]
+                team_reserved_tiles.add((nx, ny))
+            else:
+                team_reserved_tiles.add((pos[0], pos[1]))
+        else:
+            if not has_empty_queue:
+                act = unit_data["action_queue"][0]
+                if act[0] == 0:
+                    direction = act[1]
+                    move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0), 0: (0, 0)}
+                    nx, ny = pos[0] + move_deltas.get(direction, (0,0))[0], pos[1] + move_deltas.get(direction, (0,0))[1]
+                    team_reserved_tiles.add((nx, ny))
+                else:
+                    team_reserved_tiles.add((pos[0], pos[1]))
+            else:
+                team_reserved_tiles.add((pos[0], pos[1]))
 
     for f_id, f_data in factories.items():
         cargo = f_data.get("cargo", {})
