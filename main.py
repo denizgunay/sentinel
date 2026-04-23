@@ -224,7 +224,7 @@ def get_heuristic_actions(obs, player, env):
     enemy_units = p_obs.get("units", {}).get(enemy, {})
     team_reserved_tiles = set()
 
-    def get_safe_direction(u_pos, t_pos, strict_obs, relaxed_obs, w=ice.shape[0], h=ice.shape[1]):
+    def get_safe_direction(u_pos, t_pos, strict_obs, relaxed_obs, prev_pos_tuple=None, w=ice.shape[0], h=ice.shape[1]):
         diff = t_pos - u_pos
         dirs = []
         if abs(diff[0]) > abs(diff[1]):
@@ -237,13 +237,19 @@ def get_heuristic_actions(obs, player, env):
         # 1. Strict
         for d in dirs:
             nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
-            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in strict_obs:
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in strict_obs and (nx, ny) != prev_pos_tuple:
                 return d
                 
         # 2. Relaxed
         for d in dirs:
             nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
-            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in relaxed_obs:
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in relaxed_obs and (nx, ny) != prev_pos_tuple:
+                return d
+                
+        # 3. Fallback (Anti-Oscillation)
+        for d in dirs:
+            nx, ny = u_pos[0] + move_deltas[d][0], u_pos[1] + move_deltas[d][1]
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in strict_obs and (nx, ny) == prev_pos_tuple:
                 return d
                 
         return 0 # Return 0 (center/wait) if trapped
@@ -335,6 +341,7 @@ def get_heuristic_actions(obs, player, env):
         else:
             UNIT_STUCK_TIME[unit_id] = 0
         UNIT_PREV_POS[unit_id] = pos
+        prev_pos_tuple = (prev_pos[0], prev_pos[1])
 
         # Kilitlenmeyi onle: Queue guncellenmesi 1 guc yer!
         q_action = unit_data.get("action_queue")[0][0] if not has_empty_queue else -1
@@ -390,10 +397,18 @@ def get_heuristic_actions(obs, player, env):
                 target_pos = home_pos
                 is_commited = True
         
-            # 1.5 HYSTERESIS (Çıkış Bariyeri): Evdeysen 1000 güce ulaşmadan göreve çıkma!
-            elif is_on_home_anyway and unit_power < 1000 and total_cargo == 0:
-                target_pos = home_pos
-                is_commited = True
+            # 1.5 HYSTERESIS (Çıkış Bariyeri): Evdeysen dinamik güce ulaşmadan göreve çıkma!
+            elif is_on_home_anyway and total_cargo == 0:
+                current_target_pref = "ice" if home_water < 300 else my_role
+                resource_coords = ice_coords if current_target_pref == "ice" else ore_coords
+                min_dist = 0
+                if len(resource_coords) > 0:
+                    min_dist = np.min(np.abs(resource_coords - pos).sum(axis=1))
+                    
+                required_power = min(3000, min_dist * 35 + 200)
+                if unit_power < required_power:
+                    target_pos = home_pos
+                    is_commited = True
         
             # 2. RESCUE (PULL): Eğer kurtarıcı olarak atandıysam (ve evim güvendeyse)
             elif unit_id in rescue_assignments:
@@ -437,7 +452,7 @@ def get_heuristic_actions(obs, player, env):
                         dist_to_ice = np.abs(ice_coords - pos).sum(axis=1)
                         closest_ice = ice_coords[np.argmin(dist_to_ice)]
                         diff_ice = closest_ice - pos
-                        direction = get_safe_direction(pos, closest_ice, strict_obstacles, relaxed_obstacles)
+                        direction = get_safe_direction(pos, closest_ice, strict_obstacles, relaxed_obstacles, prev_pos_tuple)
                         actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
                         action_assigned = True
                     
@@ -447,7 +462,7 @@ def get_heuristic_actions(obs, player, env):
                         is_commited = False # Action: None 'durumuna pusu kurmak yerine is bulmaya gec!
 
                 else:
-                    direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
+                    direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles, prev_pos_tuple)
                     actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
                     raise SkipPlanning
 
@@ -476,6 +491,12 @@ def get_heuristic_actions(obs, player, env):
                     if best_rubble > 0 or np.array_equal(pos, home_pos):
                         target_pos = best_park_pos
         
+            # Ghost Squash Fix: Motor gücü yetersizse (Pickup yoksa) hareket etme, pos'u rezerve et
+            if unit_power < 25:
+                if unit_id not in actions:
+                    actions[unit_id] = []
+                raise SkipPlanning
+
             # Eger hala target_pos atanmadiysa (veya rubble kalmadiysa), Ice/Ore ara
             if target_pos is None:
                 current_target_pref = "ice" if home_water < 300 else my_role
@@ -493,6 +514,10 @@ def get_heuristic_actions(obs, player, env):
                 if np.array_equal(pos, target_pos):
                     actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG
                 else:
+                    dist_to_target = abs(pos[0] - target_pos[0]) + abs(pos[1] - target_pos[1])
+                    required_power = min(3000, dist_to_target * 35 + 200)
+                    distraction_banned = (unit_power < required_power) or is_emergency
+                    
                     # Rastgele Keşif ve Rubble Temizleme
                     cx, cy = pos[0], pos[1]
                     curr_rubble = rubble[cx, cy] if cx < rubble.shape[0] and cy < rubble.shape[1] else 0
@@ -502,10 +527,10 @@ def get_heuristic_actions(obs, player, env):
                     if dist_to_home == 2 and curr_rubble > 0:
                         actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Zorunlu Yol Temizliği)
                     # Eğer rubble varsa %15 ihtimalle, rubble yoksa %5 ihtimalle yolda "Dig" yaparak keşfe zaman ayır
-                    elif (curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05:
+                    elif not distraction_banned and ((curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05):
                         actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Rastgele Temizlik)
                     else:
-                        direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
+                        direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles, prev_pos_tuple)
                         actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]  # MOVE
         except SkipPlanning:
             pass
@@ -526,14 +551,14 @@ def get_heuristic_actions(obs, player, env):
                 
                 # Sabit Durma Çakışması (Eviction Check)
                 if direction == 0 and (nx, ny) in team_reserved_tiles:
-                    evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles)
+                    evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles, (pos[0], pos[1]))
                     nx, ny = pos[0] + move_deltas.get(evade_dir, (0,0))[0], pos[1] + move_deltas.get(evade_dir, (0,0))[1]
                     actions[unit_id] = [np.array([0, evade_dir, 0, 0, 0, 1])]
                     
                 team_reserved_tiles.add((nx, ny))
             else: # Dig, Transfer vb.
                 if (pos[0], pos[1]) in team_reserved_tiles:
-                    evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles)
+                    evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles, (pos[0], pos[1]))
                     nx, ny = pos[0] + move_deltas.get(evade_dir, (0,0))[0], pos[1] + move_deltas.get(evade_dir, (0,0))[1]
                     actions[unit_id] = [np.array([0, evade_dir, 0, 0, 0, 1])]
                     team_reserved_tiles.add((nx, ny))
@@ -541,7 +566,7 @@ def get_heuristic_actions(obs, player, env):
                     team_reserved_tiles.add((pos[0], pos[1]))
         else: # Action yok (Wait)
             if (pos[0], pos[1]) in team_reserved_tiles:
-                evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles)
+                evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles, (pos[0], pos[1]))
                 nx, ny = pos[0] + move_deltas.get(evade_dir, (0,0))[0], pos[1] + move_deltas.get(evade_dir, (0,0))[1]
                 actions[unit_id] = [np.array([0, evade_dir, 0, 0, 0, 1])]
                 team_reserved_tiles.add((nx, ny))
