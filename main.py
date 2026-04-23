@@ -133,6 +133,18 @@ def get_heuristic_actions(obs, player, env):
     ore = np.array(board.get("ore", [[0]]))
     rubble = np.array(board.get("rubble", [[0]]))
     
+    # KULLANICI ISTEGI: Kaynak Filtreleme (Anti-Vandalizm)
+    enemy = "player_1" if player == "player_0" else "player_0"
+    all_factories = {**factories, **p_obs.get("factories", {}).get(enemy, {})}
+    for f_id, f_data in all_factories.items():
+        fx, fy = f_data["pos"]
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                nx, ny = fx + dx, fy + dy
+                if 0 <= nx < ice.shape[0] and 0 <= ny < ice.shape[1]:
+                    ice[nx, ny] = 0
+                    ore[nx, ny] = 0
+    
     ice_coords = np.argwhere(ice > 0)
     ore_coords = np.argwhere(ore > 0)
     general_resource_coords = np.argwhere((ice > 0) | (ore > 0))
@@ -247,6 +259,8 @@ def get_heuristic_actions(obs, player, env):
         
     unit_sort_data.sort(key=lambda x: (not x["is_emergency"], x["power"], -x["cargo"], x["uid_num"]))
 
+    class SkipPlanning(Exception): pass
+
     for item in unit_sort_data:
         unit_id = item["uid"]
         unit_data = item["data"]
@@ -323,165 +337,182 @@ def get_heuristic_actions(obs, player, env):
         if is_on_home_anyway and not has_empty_queue and q_action not in [1, 2]:
             has_empty_queue = True # Bu sahte "Boş" bayrağı, is_emergency false olsa bile blok atlamamasını sağlar!
 
-        if is_emergency and not has_empty_queue:
-            if q_action in [0, 2]:
-                continue
-        
-        # Eğer queue doluysa ve acil durum / fabrika reset'i yoksa, bu robotu atla!
-        if not has_empty_queue and not is_emergency:
-            continue
-
-        # --- ROL ATAMASI (Dinamik Ekonomi) ---
-        if unit_id not in UNIT_ROLE_MAP:
-            # %70 Ice, %30 Ore olarak rolleri dağıt
-            UNIT_ROLE_MAP[unit_id] = "ice" if np.random.rand() < 0.70 else "ore"
-        
-        my_role = UNIT_ROLE_MAP[unit_id]
-
-        # --- GÖREV HİYERARŞİSİ ---
-        target_pos = None
-        is_commited = False # Eve dönüyor mu/Yardıma mı gidiyor?
-
-        # 0. LOW POWER EMERGENCY: Gücüm 150'nin altındaysa direkt eve dön (Şarj olmaya)
-        if is_emergency:
-            target_pos = home_pos
-            is_commited = True
-
-        # 1. OVERRIDE: Kendi evim yanıyorsa her şeyi bırak geri dön!
-        elif home_water < 30 and total_cargo > 0:
-            target_pos = home_pos
-            is_commited = True
-        
-        # 2. RESCUE (PULL): Eğer kurtarıcı olarak atandıysam (ve evim güvendeyse)
-        elif unit_id in rescue_assignments:
-            target_pos = rescue_assignments[unit_id]
-            is_commited = True
-        
-        # 3. HOME RETURN (PUSH): Yüküm dolduysa sadece kendi evime dön
-        elif total_cargo >= 400 and home_pos is not None:
-            target_pos = home_pos
-            is_commited = True
-
-        if is_commited and target_pos is not None:
-            # 3x3 Fabrika Alanı Chebyshev Checker: Robot merkeze en fazla 1 uzaklıkta mı?
-            is_on_target = max(abs(pos[0] - target_pos[0]), abs(pos[1] - target_pos[1])) <= 1
+        try:
+            if is_emergency and not has_empty_queue:
+                if q_action in [0, 2]:
+                    raise SkipPlanning
             
-            if is_on_target:
-                # Sadece kendi evimizdeysek şarj olabiliriz
-                is_on_home = (home_pos is not None) and max(abs(pos[0] - home_pos[0]), abs(pos[1] - home_pos[1])) <= 1
-                
-                action_assigned = False
+            # Eğer queue doluysa ve acil durum / fabrika reset'i yoksa, bu robotu atla!
+            if not has_empty_queue and not is_emergency:
+                raise SkipPlanning
 
-                if is_on_home:
-                    home_fac_power = home_data.get("power", 0)
-                    if unit_power < 3000 and home_fac_power > 0: # 1500 baraji kalkti, 3000'e kadar sarj izni
-                        pickup_amount = min(home_fac_power, 3000 - unit_power)
-                        if pickup_amount > 0:
-                            actions[unit_id] = [np.array([2, 0, 4, pickup_amount, 0, 1])]
+            # --- ROL ATAMASI (Dinamik Ekonomi) ---
+            if unit_id not in UNIT_ROLE_MAP:
+                # %70 Ice, %30 Ore olarak rolleri dağıt
+                UNIT_ROLE_MAP[unit_id] = "ice" if np.random.rand() < 0.70 else "ore"
+        
+            my_role = UNIT_ROLE_MAP[unit_id]
+
+            # --- GÖREV HİYERARŞİSİ ---
+            target_pos = None
+            is_commited = False # Eve dönüyor mu/Yardıma mı gidiyor?
+
+            # 0. LOW POWER EMERGENCY: Gücüm 150'nin altındaysa direkt eve dön (Şarj olmaya)
+            if is_emergency:
+                target_pos = home_pos
+                is_commited = True
+
+            # 1. OVERRIDE: Kendi evim yanıyorsa her şeyi bırak geri dön!
+            elif home_water < 30 and total_cargo > 0:
+                target_pos = home_pos
+                is_commited = True
+        
+            # 2. RESCUE (PULL): Eğer kurtarıcı olarak atandıysam (ve evim güvendeyse)
+            elif unit_id in rescue_assignments:
+                target_pos = rescue_assignments[unit_id]
+                is_commited = True
+        
+            # 3. HOME RETURN (PUSH): Yüküm dolduysa sadece kendi evime dön
+            elif total_cargo >= 400 and home_pos is not None:
+                target_pos = home_pos
+                is_commited = True
+
+            if is_commited and target_pos is not None:
+                # 3x3 Fabrika Alanı Chebyshev Checker: Robot merkeze en fazla 1 uzaklıkta mı?
+                is_on_target = max(abs(pos[0] - target_pos[0]), abs(pos[1] - target_pos[1])) <= 1
+            
+                if is_on_target:
+                    # Sadece kendi evimizdeysek şarj olabiliriz
+                    is_on_home = (home_pos is not None) and max(abs(pos[0] - home_pos[0]), abs(pos[1] - home_pos[1])) <= 1
+                
+                    action_assigned = False
+
+                    if is_on_home:
+                        home_fac_power = home_data.get("power", 0)
+                        if unit_power < 3000 and home_fac_power > 0: # 1500 baraji kalkti, 3000'e kadar sarj izni
+                            pickup_amount = min(home_fac_power, 3000 - unit_power)
+                            if pickup_amount > 0:
+                                actions[unit_id] = [np.array([2, 0, 4, pickup_amount, 0, 1])]
+                                action_assigned = True
+
+                    # Kargo Aktarımı (Target ne olursa olsun yapilabilir, ornegin rescue edilen fabrikaya water atmak icin)
+                    if not action_assigned and total_cargo > 0:
+                        if cargo.get("ice", 0) > 0:
+                            actions[unit_id] = [np.array([1, 0, 0, cargo["ice"], 0, 1])] # Ice transfer
+                            action_assigned = True
+                        elif cargo.get("ore", 0) > 0:
+                            actions[unit_id] = [np.array([1, 0, 1, cargo["ore"], 0, 1])] # Ore transfer
                             action_assigned = True
 
-                # Kargo Aktarımı (Target ne olursa olsun yapilabilir, ornegin rescue edilen fabrikaya water atmak icin)
-                if not action_assigned and total_cargo > 0:
-                    if cargo.get("ice", 0) > 0:
-                        actions[unit_id] = [np.array([1, 0, 0, cargo["ice"], 0, 1])] # Ice transfer
+                    # EJECTION PROTOCOL: Kargomuz yok, şarjımız 1500+ ve EVDEYSEK (hemen cikip Idle Task'a düs!)
+                    if not action_assigned and is_on_home and unit_power > 1500 and total_cargo == 0 and len(ice_coords) > 0:
+                        dist_to_ice = np.abs(ice_coords - pos).sum(axis=1)
+                        closest_ice = ice_coords[np.argmin(dist_to_ice)]
+                        diff_ice = closest_ice - pos
+                        direction = get_safe_direction(pos, closest_ice, strict_obstacles, relaxed_obstacles)
+                        actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
                         action_assigned = True
-                    elif cargo.get("ore", 0) > 0:
-                        actions[unit_id] = [np.array([1, 0, 1, cargo["ore"], 0, 1])] # Ore transfer
-                        action_assigned = True
-
-                # EJECTION PROTOCOL: Kargomuz yok, şarjımız 1500+ ve EVDEYSEK (hemen cikip Idle Task'a düs!)
-                if not action_assigned and is_on_home and unit_power > 1500 and total_cargo == 0 and len(ice_coords) > 0:
-                    dist_to_ice = np.abs(ice_coords - pos).sum(axis=1)
-                    closest_ice = ice_coords[np.argmin(dist_to_ice)]
-                    diff_ice = closest_ice - pos
-                    direction = get_safe_direction(pos, closest_ice, strict_obstacles, relaxed_obstacles)
-                    actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
-                    action_assigned = True
                     
-                if action_assigned:
-                    continue 
-                else:
-                    is_commited = False # Action: None 'durumuna pusu kurmak yerine is bulmaya gec!
+                    if action_assigned:
+                        raise SkipPlanning
+                    else:
+                        is_commited = False # Action: None 'durumuna pusu kurmak yerine is bulmaya gec!
 
-            else:
-                direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
-                actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
-                # NOT continue here! We must hit the Tile Reservation block at the end of the loop!
-
-        # --- YENİ KAYNAK HEDEFİ BELİRLEME, BEKLEME İSTASYONU VEYA MOLOZ TEMİZLİĞİ ---
-        # 1. Bekleme İstasyonu: Eğar unit dolu degilse, işi bittiyse ve sarji yerindeyse.
-        if total_cargo == 0 and unit_power > 1500 and home_pos is not None:
-            # Fabrika etrafindaki rubble dolu Chebyshev==2 bloklarina git
-            best_park_pos = None
-            best_rubble = -1
-            
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    if max(abs(dx), abs(dy)) == 2:
-                        rx, ry = home_pos[0] + dx, home_pos[1] + dy
-                        if 0 <= rx < rubble.shape[0] and 0 <= ry < rubble.shape[1]:
-                            if (rx, ry) not in team_reserved_tiles:
-                                # Daha cok rubble olan yere park et ki orayi temizlesin
-                                r_val = rubble[rx, ry]
-                                if r_val > best_rubble:
-                                    best_rubble = r_val
-                                    best_park_pos = np.array([rx, ry])
-                                    
-            if best_park_pos is not None:
-                team_reserved_tiles.add((best_park_pos[0], best_park_pos[1]))
-                # Sadece moloz varsa parkta kal, yoksa diger kaynaklara dogru Ejection baslasin.
-                if best_rubble > 0 or np.array_equal(pos, home_pos):
-                    target_pos = best_park_pos
-        
-        # Eger hala target_pos atanmadiysa (veya rubble kalmadiysa), Ice/Ore ara
-        if target_pos is None:
-            current_target_pref = "ice" if home_water < 300 else my_role
-            resource_coords = ice_coords if current_target_pref == "ice" else ore_coords
-            
-            if len(resource_coords) > 0:
-                dist = np.abs(resource_coords - pos).sum(axis=1)
-                sorted_idx = np.argsort(dist)
-                target_idx = sorted_idx[0]
-                if len(sorted_idx) > 1 and np.random.rand() < 0.10:
-                    target_idx = sorted_idx[1]
-                target_pos = resource_coords[target_idx]
-
-        if target_pos is not None:
-            if np.array_equal(pos, target_pos):
-                actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG
-            else:
-                # Rastgele Keşif ve Rubble Temizleme
-                cx, cy = pos[0], pos[1]
-                curr_rubble = rubble[cx, cy] if cx < rubble.shape[0] and cy < rubble.shape[1] else 0
-                
-                # Eğer rubble varsa %15 ihtimalle, rubble yoksa %5 ihtimalle yolda "Dig" yaparak keşfe zaman ayır
-                if (curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05:
-                    actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Rubble temizliği / Mola)
                 else:
                     direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
-                    actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]  # MOVE
+                    actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]
+                    raise SkipPlanning
+
+            # --- YENİ KAYNAK HEDEFİ BELİRLEME, BEKLEME İSTASYONU VEYA MOLOZ TEMİZLİĞİ ---
+            # 1. Bekleme İstasyonu: Eğar unit dolu degilse, işi bittiyse ve sarji yerindeyse.
+            if total_cargo == 0 and unit_power > 1500 and home_pos is not None:
+                # Fabrika etrafindaki rubble dolu Chebyshev==2 bloklarina git
+                best_park_pos = None
+                best_rubble = -1
+            
+                for dx in range(-2, 3):
+                    for dy in range(-2, 3):
+                        if max(abs(dx), abs(dy)) == 2:
+                            rx, ry = home_pos[0] + dx, home_pos[1] + dy
+                            if 0 <= rx < rubble.shape[0] and 0 <= ry < rubble.shape[1]:
+                                if (rx, ry) not in team_reserved_tiles:
+                                    # Daha cok rubble olan yere park et ki orayi temizlesin
+                                    r_val = rubble[rx, ry]
+                                    if r_val > best_rubble:
+                                        best_rubble = r_val
+                                        best_park_pos = np.array([rx, ry])
+                                    
+                if best_park_pos is not None:
+                    team_reserved_tiles.add((best_park_pos[0], best_park_pos[1]))
+                    # Sadece moloz varsa parkta kal, yoksa diger kaynaklara dogru Ejection baslasin.
+                    if best_rubble > 0 or np.array_equal(pos, home_pos):
+                        target_pos = best_park_pos
+        
+            # Eger hala target_pos atanmadiysa (veya rubble kalmadiysa), Ice/Ore ara
+            if target_pos is None:
+                current_target_pref = "ice" if home_water < 300 else my_role
+                resource_coords = ice_coords if current_target_pref == "ice" else ore_coords
+            
+                if len(resource_coords) > 0:
+                    dist = np.abs(resource_coords - pos).sum(axis=1)
+                    sorted_idx = np.argsort(dist)
+                    target_idx = sorted_idx[0]
+                    if len(sorted_idx) > 1 and np.random.rand() < 0.10:
+                        target_idx = sorted_idx[1]
+                    target_pos = resource_coords[target_idx]
+
+            if target_pos is not None:
+                if np.array_equal(pos, target_pos):
+                    actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG
+                else:
+                    # Rastgele Keşif ve Rubble Temizleme
+                    cx, cy = pos[0], pos[1]
+                    curr_rubble = rubble[cx, cy] if cx < rubble.shape[0] and cy < rubble.shape[1] else 0
+                
+                    # Eğer rubble varsa %15 ihtimalle, rubble yoksa %5 ihtimalle yolda "Dig" yaparak keşfe zaman ayır
+                    if (curr_rubble > 0 and np.random.rand() < 0.15) or np.random.rand() < 0.05:
+                        actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Rubble temizliği / Mola)
+                    else:
+                        direction = get_safe_direction(pos, target_pos, strict_obstacles, relaxed_obstacles)
+                        actions[unit_id] = [np.array([0, direction, 0, 0, 0, 1])]  # MOVE
+        except SkipPlanning:
+            pass
 
         # --- ROTA REZERVASYONU (Tile Reservation) ---
         assigned_action = actions.get(unit_id)
+        act = None
         if assigned_action and len(assigned_action) > 0:
             act = assigned_action[0]
+        elif not has_empty_queue:
+            act = unit_data["action_queue"][0]
+            
+        move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0), 0: (0, 0)}
+        if act is not None:
             if act[0] == 0: # Move
                 direction = act[1]
-                move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0), 0: (0, 0)}
                 nx, ny = pos[0] + move_deltas.get(direction, (0,0))[0], pos[1] + move_deltas.get(direction, (0,0))[1]
+                
+                # Sabit Durma Çakışması (Eviction Check)
+                if direction == 0 and (nx, ny) in team_reserved_tiles:
+                    evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles)
+                    nx, ny = pos[0] + move_deltas.get(evade_dir, (0,0))[0], pos[1] + move_deltas.get(evade_dir, (0,0))[1]
+                    actions[unit_id] = [np.array([0, evade_dir, 0, 0, 0, 1])]
+                    
                 team_reserved_tiles.add((nx, ny))
-            else:
-                team_reserved_tiles.add((pos[0], pos[1]))
-        else:
-            if not has_empty_queue:
-                act = unit_data["action_queue"][0]
-                if act[0] == 0:
-                    direction = act[1]
-                    move_deltas = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0), 0: (0, 0)}
-                    nx, ny = pos[0] + move_deltas.get(direction, (0,0))[0], pos[1] + move_deltas.get(direction, (0,0))[1]
+            else: # Dig, Transfer vb.
+                if (pos[0], pos[1]) in team_reserved_tiles:
+                    evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles)
+                    nx, ny = pos[0] + move_deltas.get(evade_dir, (0,0))[0], pos[1] + move_deltas.get(evade_dir, (0,0))[1]
+                    actions[unit_id] = [np.array([0, evade_dir, 0, 0, 0, 1])]
                     team_reserved_tiles.add((nx, ny))
                 else:
                     team_reserved_tiles.add((pos[0], pos[1]))
+        else: # Action yok (Wait)
+            if (pos[0], pos[1]) in team_reserved_tiles:
+                evade_dir = get_safe_direction(pos, pos, strict_obstacles, relaxed_obstacles)
+                nx, ny = pos[0] + move_deltas.get(evade_dir, (0,0))[0], pos[1] + move_deltas.get(evade_dir, (0,0))[1]
+                actions[unit_id] = [np.array([0, evade_dir, 0, 0, 0, 1])]
+                team_reserved_tiles.add((nx, ny))
             else:
                 team_reserved_tiles.add((pos[0], pos[1]))
 
