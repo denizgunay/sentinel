@@ -516,14 +516,24 @@ def get_heuristic_actions(obs, player, env):
                 else:
                     dist_to_target = abs(pos[0] - target_pos[0]) + abs(pos[1] - target_pos[1])
                     required_power = min(3000, dist_to_target * 35 + 200)
+                    dist_to_home = max(abs(pos[0] - home_pos[0]), abs(pos[1] - home_pos[1])) if home_pos is not None else 99
+                    
+                    # 1. Energy Guard
                     distraction_banned = (unit_power < required_power) or is_emergency
+                    
+                    # 2. Homebound Priority: Kargo dolu eve dönüyorsan %80 (2400) güçten aşağısında temizlik yapma
+                    if is_commited and total_cargo > 0 and unit_power < 2400:
+                        distraction_banned = True
+                        
+                    # 3. Path Efficiency: Fabrikaya 8 kareden uzak yerlerde enerji israf etme
+                    if dist_to_home > 8:
+                        distraction_banned = True
                     
                     # Rastgele Keşif ve Rubble Temizleme
                     cx, cy = pos[0], pos[1]
                     curr_rubble = rubble[cx, cy] if cx < rubble.shape[0] and cy < rubble.shape[1] else 0
                     
                     # Rubble Clearing on Exit: Eğer evimize tam 2 birim uzaktaysak ve moloz varsa KESİN temizle
-                    dist_to_home = max(abs(pos[0] - home_pos[0]), abs(pos[1] - home_pos[1])) if home_pos is not None else 99
                     if dist_to_home == 2 and curr_rubble > 0:
                         actions[unit_id] = [np.array([3, 0, 0, 0, 0, 1])]   # DIG (Zorunlu Yol Temizliği)
                     # Eğer rubble varsa %15 ihtimalle, rubble yoksa %5 ihtimalle yolda "Dig" yaparak keşfe zaman ayır
