@@ -76,13 +76,9 @@ def get_heuristic_actions(obs, player, env):
                             np.min([np.abs(s - ef).sum() for ef in existing_factories])
                             for s in valid_spawns
                         ])
-                        mask = (dists_to_others >= 5) & (dists_to_others <= 15)
+                        mask = dists_to_others >= 5
                         if np.any(mask):
                             valid_spawns = valid_spawns[mask]
-                        else:
-                            mask_fallback = dists_to_others >= 5
-                            if np.any(mask_fallback):
-                                valid_spawns = valid_spawns[mask_fallback]
 
                     # Seçilen hedefe (ice) en yakın olanı bul
                     res_pref = "ice"
@@ -94,8 +90,12 @@ def get_heuristic_actions(obs, player, env):
                                 np.min(np.abs(coords - s).sum(axis=1))
                                 for s in valid_spawns
                             ])
-                            spawn_xy = [int(valid_spawns[np.argmin(dists)][0]),
-                                        int(valid_spawns[np.argmin(dists)][1])]
+                            # Top-K Sampling: En iyi 5 noktadan rastgele birini seç
+                            top_k = min(5, len(dists))
+                            top_k_indices = np.argsort(dists)[:top_k]
+                            chosen_idx = np.random.choice(top_k_indices)
+                            spawn_xy = [int(valid_spawns[chosen_idx][0]),
+                                        int(valid_spawns[chosen_idx][1])]
                         else:
                             np.random.shuffle(valid_spawns)
                             spawn_xy = [int(valid_spawns[0][0]), int(valid_spawns[0][1])]
@@ -112,6 +112,10 @@ def get_heuristic_actions(obs, player, env):
                     # icin per_water/per_metal deklare ediyoruz ki sistem cokmesin ve 1000+ adim yasayalim.
                     per_water   = avail_water
                     per_metal   = avail_metal
+                    
+                    # Seçimi diğer oyuncunun görmesi için kaydet
+                    GLOBAL_PENDING_SPAWNS[player].append(spawn_xy)
+                    
                     if not GLOBAL_HUB_BUILT.get(player, False):
                         print(f"  [PLACEMENT] {player}: MEGA-HUB spawn={spawn_xy} water={per_water} metal={per_metal}")
                         GLOBAL_HUB_BUILT[player] = True
